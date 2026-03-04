@@ -38,6 +38,6 @@ jobs:
             cd ..
 
             # Restart backend
-            pm2 restart portfolio-backend
+            pm2 restart portfolio-builder
 
             echo "✅ Deployment successful!"
