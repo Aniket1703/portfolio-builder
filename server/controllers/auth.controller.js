@@ -4,10 +4,9 @@ import jwt from 'jsonwebtoken';
 import crypto from 'crypto';
 import { validationResult } from 'express-validator';
 
-// Generate Access Token (short-lived)
 const generateAccessToken = (id) => {
   return jwt.sign({ id }, process.env.JWT_SECRET, {
-    expiresIn: '15m' // 15 minutes
+    expiresIn: '15m'
   });
 };
 
@@ -35,25 +34,22 @@ const sendTokenResponse = async (user, statusCode, res, message, req) => {
   const accessToken = generateAccessToken(user._id);
   const refreshToken = generateRefreshToken();
 
-  // Save refresh token to DB
   await saveRefreshToken(user._id, refreshToken, req);
 
-  // Access token in HTTP-only cookie (short expiration)
   res.cookie('accessToken', accessToken, {
-    expires: new Date(Date.now() + 15 * 60 * 1000), // 15 minutes
+    expires: new Date(Date.now() + 15 * 60 * 1000),
     httpOnly: true,
     secure: process.env.NODE_ENV === 'production',
     sameSite: process.env.NODE_ENV === 'production' ? 'none' : 'lax',
     path: '/'
   });
 
-  // Refresh token in HTTP-only cookie (long expiration)
   res.cookie('refreshToken', refreshToken, {
-    expires: new Date(Date.now() + 7 * 24 * 60 * 60 * 1000), // 7 days
+    expires: new Date(Date.now() + 7 * 24 * 60 * 60 * 1000),
     httpOnly: true,
     secure: process.env.NODE_ENV === 'production',
     sameSite: process.env.NODE_ENV === 'production' ? 'none' : 'lax',
-    path: '/api/auth' // Only sent to auth endpoints
+    path: '/api/auth'
   });
 
   res.status(statusCode).json({
@@ -68,9 +64,6 @@ const sendTokenResponse = async (user, statusCode, res, message, req) => {
   });
 };
 
-// @desc    Refresh access token
-// @route   POST /api/auth/refresh-token
-// @access  Public
 export const refreshAccessToken = async (req, res) => {
   try {
     const { refreshToken } = req.cookies;
@@ -82,11 +75,9 @@ export const refreshAccessToken = async (req, res) => {
       });
     }
 
-    // Find refresh token in database
-    const storedToken = await RefreshToken.findOne({
-      token: refreshToken,
-      isRevoked: false
-    });
+    // Find token in DB regardless of revocation status
+    // (we need to check reuse even on revoked tokens)
+    const storedToken = await RefreshToken.findOne({ token: refreshToken });
 
     if (!storedToken) {
       return res.status(401).json({
@@ -95,7 +86,24 @@ export const refreshAccessToken = async (req, res) => {
       });
     }
 
-    // Check if expired
+    // If token is already revoked, someone is reusing an old token — possible theft
+    if (storedToken.isRevoked) {
+      // Revoke ALL tokens for this user to force re-login
+      await RefreshToken.updateMany(
+        { userId: storedToken.userId },
+        { isRevoked: true, revokedAt: new Date() }
+      );
+
+      res.cookie('accessToken', 'none', { expires: new Date(Date.now() + 10 * 1000), httpOnly: true });
+      res.cookie('refreshToken', 'none', { expires: new Date(Date.now() + 10 * 1000), httpOnly: true });
+
+      return res.status(401).json({
+        success: false,
+        message: 'Token reuse detected. Please login again.',
+        code: 'TOKEN_REUSE'
+      });
+    }
+
     if (new Date() > storedToken.expiresAt) {
       return res.status(401).json({
         success: false,
@@ -103,7 +111,6 @@ export const refreshAccessToken = async (req, res) => {
       });
     }
 
-    // Generate new access token
     const user = await User.findById(storedToken.userId);
     if (!user) {
       return res.status(401).json({
@@ -112,15 +119,40 @@ export const refreshAccessToken = async (req, res) => {
       });
     }
 
+    // Generate brand new refresh token
+    const newRefreshToken = generateRefreshToken();
+
+    // Revoke the OLD refresh token, record what replaced it
+    await RefreshToken.updateOne(
+      { token: refreshToken },
+      {
+        isRevoked: true,
+        revokedAt: new Date(),
+        replacedByToken: newRefreshToken  // uses the field already in your schema
+      }
+    );
+
+    // Save the new refresh token
+    await saveRefreshToken(user._id, newRefreshToken, req);
+
+    // Issue new access token
     const accessToken = generateAccessToken(user._id);
 
-    // Send new access token
+    // Set both new cookies
     res.cookie('accessToken', accessToken, {
       expires: new Date(Date.now() + 15 * 60 * 1000),
       httpOnly: true,
       secure: process.env.NODE_ENV === 'production',
       sameSite: process.env.NODE_ENV === 'production' ? 'none' : 'lax',
       path: '/'
+    });
+
+    res.cookie('refreshToken', newRefreshToken, {
+      expires: new Date(Date.now() + 7 * 24 * 60 * 60 * 1000),
+      httpOnly: true,
+      secure: process.env.NODE_ENV === 'production',
+      sameSite: process.env.NODE_ENV === 'production' ? 'none' : 'lax',
+      path: '/api/auth'
     });
 
     res.status(200).json({
@@ -136,14 +168,10 @@ export const refreshAccessToken = async (req, res) => {
   }
 };
 
-// @desc    Logout and revoke refresh token
-// @route   POST /api/auth/logout
-// @access  Private
 export const logout = async (req, res) => {
   try {
     const { refreshToken } = req.cookies;
 
-    // Revoke refresh token
     if (refreshToken) {
       await RefreshToken.updateOne(
         { token: refreshToken },
@@ -151,7 +179,6 @@ export const logout = async (req, res) => {
       );
     }
 
-    // Clear cookies
     res.cookie('accessToken', 'none', {
       expires: new Date(Date.now() + 10 * 1000),
       httpOnly: true
@@ -175,7 +202,6 @@ export const logout = async (req, res) => {
   }
 };
 
-// Update login and register to use new token system
 export const login = async (req, res) => {
   try {
     const errors = validationResult(req);
@@ -245,7 +271,6 @@ export const register = async (req, res) => {
   }
 };
 
-// @desc    Get current user
 export const getMe = async (req, res) => {
   try {
     const user = await User.findById(req.user._id);
@@ -268,10 +293,26 @@ export const getMe = async (req, res) => {
   }
 };
 
-// @desc    Update user profile
 export const updateProfile = async (req, res) => {
   try {
     const { name, profilePhoto } = req.body;
+
+    if (profilePhoto) {
+      try {
+        const url = new URL(profilePhoto);
+        if (!['http:', 'https:'].includes(url.protocol)) {
+          return res.status(400).json({
+            success: false,
+            message: 'Profile photo must be a valid http or https URL'
+          });
+        }
+      } catch {
+        return res.status(400).json({
+          success: false,
+          message: 'Invalid profile photo URL'
+        });
+      }
+    }
 
     const user = await User.findById(req.user._id);
 
